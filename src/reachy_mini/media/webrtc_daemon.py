@@ -30,6 +30,8 @@ Example usage:
 
 import logging
 import os
+import shutil
+import subprocess
 from threading import Thread
 from typing import Optional, Tuple, cast
 
@@ -93,6 +95,7 @@ class GstWebRTC:
         """
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(log_level)
+        self._rpicam_proc: Optional[subprocess.Popen] = None
 
         Gst.init(None)
         self._loop = GLib.MainLoop()
@@ -127,9 +130,23 @@ class GstWebRTC:
         )
         self._configure_receiver(self._pipeline_receiver)
 
+    def _cleanup_rpicam(self) -> None:
+        """Terminate the rpicam-vid subprocess if running."""
+        if self._rpicam_proc is not None and self._rpicam_proc.poll() is None:
+            self._logger.info("Terminating rpicam-vid subprocess")
+            self._rpicam_proc.terminate()
+            try:
+                self._rpicam_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                self._logger.warning("rpicam-vid didn't exit, killing")
+                self._rpicam_proc.kill()
+                self._rpicam_proc.wait()
+            self._rpicam_proc = None
+
     def __del__(self) -> None:
         """Destructor to ensure gstreamer resources are released."""
         self._logger.debug("Cleaning up GstWebRTC")
+        self._cleanup_rpicam()
         self._loop.quit()
         self._bus_sender.remove_watch()
         self._bus_receiver.remove_watch()
@@ -153,6 +170,12 @@ class GstWebRTC:
         meta_structure.set_value("name", "reachymini")
         webrtcsink.set_property("meta", meta_structure)
         webrtcsink.set_property("run-signalling-server", True)
+
+        # Disable FEC and retransmission — both add latency waiting for
+        # lost-packet recovery. On Tailscale/LAN the loss rate is near zero;
+        # the latency cost outweighs the reliability gain.
+        webrtcsink.set_property("do-fec", False)
+        webrtcsink.set_property("do-retransmission", False)
 
         webrtcsink.connect("consumer-added", self._consumer_added)
 
@@ -181,8 +204,8 @@ class GstWebRTC:
         capsfilter.set_property("caps", caps)
         rtpjitterbuffer = Gst.ElementFactory.make("rtpjitterbuffer")
         rtpjitterbuffer.set_property(
-            "latency", 200
-        )  # configure latency depending on network conditions
+            "latency", 50
+        )  # 50ms is sufficient on Tailscale/LAN; was 200ms
         rtpopusdepay = Gst.ElementFactory.make("rtpopusdepay")
         opusdec = Gst.ElementFactory.make("opusdec")
         queue = Gst.ElementFactory.make("queue")
@@ -227,6 +250,137 @@ class GstWebRTC:
         self, cam_path: str, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
     ) -> None:
         self._logger.debug(f"Configuring video {cam_path}")
+        if cam_path == "imx708":
+            self._configure_video_rpicam(pipeline, webrtcsink)
+        else:
+            self._configure_video_v4l2(cam_path, pipeline, webrtcsink)
+
+    def _configure_video_rpicam(
+        self, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
+    ) -> None:
+        """Configure video using rpicam-vid subprocess for IMX708 camera.
+
+        Bypasses the broken v4l2h264enc GStreamer element by using rpicam-vid
+        which accesses the hardware H.264 encoder directly via libcamera.
+        The H.264 output is tee'd three ways: WebRTC, MPEG-TS TCP, and
+        decoded raw frames for the unix socket (MJPEG HTTP).
+        """
+        if not shutil.which("rpicam-vid"):
+            raise RuntimeError(
+                "rpicam-vid not found. Required for IMX708 camera on this hardware."
+            )
+
+        width, height = self.resolution
+        fps = self.framerate
+        cmd = [
+            "rpicam-vid",
+            "-t", "0",                    # run forever
+            "--width", str(width),
+            "--height", str(height),
+            "--framerate", str(fps),
+            "--codec", "h264",
+            "--profile", "baseline",       # constrained baseline for Safari/WebKit
+            "--inline",                    # repeat SPS/PPS (matches repeat_sequence_header=1)
+            "--bitrate", "5000000",        # 5 Mbps (matches v4l2h264enc video_bitrate)
+            "--intra", "15",               # IDR every 15 frames (0.5s at 30fps) — faster connect/recovery
+            "-o", "-",                     # output to stdout
+        ]
+        self._logger.info(f"Starting rpicam-vid: {' '.join(cmd)}")
+        self._rpicam_proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+        )
+
+        # --- GStreamer elements ---
+        fdsrc = Gst.ElementFactory.make("fdsrc")
+        fdsrc.set_property("fd", self._rpicam_proc.stdout.fileno())
+
+        h264parse = Gst.ElementFactory.make("h264parse")
+
+        # Caps filter so webrtcsink knows it's receiving pre-encoded H.264
+        caps_h264 = Gst.Caps.from_string(
+            "video/x-h264,stream-format=byte-stream,alignment=au"
+        )
+        capsfilter_h264 = Gst.ElementFactory.make("capsfilter", "capsfilter_h264")
+        capsfilter_h264.set_property("caps", caps_h264)
+
+        h264_tee = Gst.ElementFactory.make("tee", "h264_tee")
+
+        # Branch 1: WebRTC — leaky so old frames are dropped rather than buffered
+        queue_webrtc = Gst.ElementFactory.make("queue", "queue_webrtc")
+        queue_webrtc.set_property("max-size-buffers", 1)
+        queue_webrtc.set_property("max-size-bytes", 0)
+        queue_webrtc.set_property("max-size-time", 0)
+        queue_webrtc.set_property("leaky", 2)  # drop oldest (downstream)
+
+        # Branch 2: MPEG-TS over TCP for recording pipeline
+        queue_tcp = Gst.ElementFactory.make("queue", "queue_tcp")
+        h264parse_tcp = Gst.ElementFactory.make("h264parse", "h264parse_tcp")
+        mpegtsmux = Gst.ElementFactory.make("mpegtsmux")
+        tcpserversink = Gst.ElementFactory.make("tcpserversink")
+        tcpserversink.set_property("host", "0.0.0.0")
+        tcpserversink.set_property("port", 9001)
+        tcpserversink.set_property("recover-policy", 3)  # keyframe
+        tcpserversink.set_property("sync", False)  # don't let slow/absent clients backpressure the tee
+
+        # Branch 3: Decode to raw frames for unix socket (MJPEG HTTP)
+        queue_decode = Gst.ElementFactory.make("queue", "queue_decode")
+        avdec_h264 = Gst.ElementFactory.make("avdec_h264")
+        if not avdec_h264:
+            raise RuntimeError(
+                "avdec_h264 not found. Install gstreamer1.0-libav: "
+                "sudo apt install gstreamer1.0-libav"
+            )
+        videoconvert = Gst.ElementFactory.make("videoconvert")
+        unixfdsink = Gst.ElementFactory.make("unixfdsink")
+        if is_local_camera_available():
+            os.remove(CAMERA_SOCKET_PATH)
+        unixfdsink.set_property("socket-path", CAMERA_SOCKET_PATH)
+
+        elements = [
+            fdsrc, h264parse, capsfilter_h264, h264_tee,
+            queue_webrtc,
+            queue_tcp, h264parse_tcp, mpegtsmux, tcpserversink,
+            queue_decode, avdec_h264, videoconvert, unixfdsink,
+        ]
+        if not all(elements):
+            self._cleanup_rpicam()
+            raise RuntimeError("Failed to create GStreamer video elements for rpicam pipeline")
+
+        for elem in elements:
+            pipeline.add(elem)
+
+        # Link: fdsrc → h264parse → capsfilter_h264 → h264_tee
+        fdsrc.link(h264parse)
+        h264parse.link(capsfilter_h264)
+        capsfilter_h264.link(h264_tee)
+
+        # Branch 1: WebRTC
+        h264_tee.link(queue_webrtc)
+        queue_webrtc.link(webrtcsink)
+
+        # Branch 2: MPEG-TS over TCP
+        h264_tee.link(queue_tcp)
+        queue_tcp.link(h264parse_tcp)
+        h264parse_tcp.link(mpegtsmux)
+        mpegtsmux.link(tcpserversink)
+
+        # Branch 3: Decode → raw frames → unix socket
+        h264_tee.link(queue_decode)
+        queue_decode.link(avdec_h264)
+        avdec_h264.link(videoconvert)
+        videoconvert.link(unixfdsink)
+
+        self._logger.info(
+            "rpicam-vid pipeline configured: WebRTC + TCP:9001 + unix socket"
+        )
+
+    def _configure_video_v4l2(
+        self, cam_path: str, pipeline: Gst.Pipeline, webrtcsink: Gst.Element
+    ) -> None:
+        """Configure video using libcamerasrc + v4l2h264enc (original pipeline).
+
+        Used for non-IMX708 cameras where v4l2h264enc works correctly.
+        """
         camerasrc = Gst.ElementFactory.make("libcamerasrc")
         caps = Gst.Caps.from_string(
             f"video/x-raw,width={self.resolution[0]},height={self.resolution[1]},framerate={self.framerate}/1,format=YUY2,colorimetry=bt709,interlace-mode=progressive"
@@ -261,6 +415,10 @@ class GstWebRTC:
         # Tee the H.264 output: one branch to WebRTC, one to TCP for recording pipeline
         h264_tee = Gst.ElementFactory.make("tee", "h264_tee")
         queue_webrtc = Gst.ElementFactory.make("queue", "queue_webrtc")
+        queue_webrtc.set_property("max-size-buffers", 1)
+        queue_webrtc.set_property("max-size-bytes", 0)
+        queue_webrtc.set_property("max-size-time", 0)
+        queue_webrtc.set_property("leaky", 2)  # drop oldest (downstream)
         queue_tcp = Gst.ElementFactory.make("queue", "queue_tcp")
         h264parse = Gst.ElementFactory.make("h264parse")
         mpegtsmux = Gst.ElementFactory.make("mpegtsmux")
@@ -269,6 +427,7 @@ class GstWebRTC:
         tcpserversink.set_property("port", 9001)
         # Recover from disconnected clients by starting from the next keyframe
         tcpserversink.set_property("recover-policy", 3)  # keyframe
+        tcpserversink.set_property("sync", False)  # don't let slow/absent clients backpressure the tee
 
         if not all(
             [
@@ -327,7 +486,9 @@ class GstWebRTC:
 
         alsasrc = Gst.ElementFactory.make("alsasrc")
         alsasrc.set_property("device", "reachymini_audio_src")
-        # to optimize the latency, tune ~/.asoundrc file
+        # Reduce ALSA capture buffer from default (~1s) to 20ms for lower audio latency
+        alsasrc.set_property("buffer-time", 20000)   # microseconds
+        alsasrc.set_property("latency-time", 10000)  # microseconds
 
         if not all([alsasrc]):
             raise RuntimeError("Failed to create GStreamer audio elements")
@@ -435,6 +596,7 @@ class GstWebRTC:
 
         self._pipeline_sender.set_state(Gst.State.NULL)
         self._pipeline_receiver.set_state(Gst.State.NULL)
+        self._cleanup_rpicam()
 
 
 if __name__ == "__main__":
