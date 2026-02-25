@@ -29,15 +29,14 @@ Example usage:
 """
 
 import logging
-import os
 import shutil
 import subprocess
 from threading import Thread
 from typing import Optional, Tuple, cast
 
 import gi
-
-from reachy_mini.daemon.utils import CAMERA_SOCKET_PATH, is_local_camera_available
+import numpy as np
+import numpy.typing as npt
 from reachy_mini.media.camera_constants import (
     ArducamSpecs,
     CameraSpecs,
@@ -48,7 +47,7 @@ from reachy_mini.media.camera_constants import (
 gi.require_version("Gst", "1.0")
 gi.require_version("GstApp", "1.0")
 
-from gi.repository import GLib, Gst  # noqa: E402
+from gi.repository import GLib, Gst, GstApp  # noqa: E402
 
 
 class GstWebRTC:
@@ -96,6 +95,7 @@ class GstWebRTC:
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(log_level)
         self._rpicam_proc: Optional[subprocess.Popen] = None
+        self._appsink: Optional[Gst.Element] = None
 
         Gst.init(None)
         self._loop = GLib.MainLoop()
@@ -327,7 +327,7 @@ class GstWebRTC:
         tcpserversink.set_property("recover-policy", 3)  # keyframe
         tcpserversink.set_property("sync", False)  # don't let slow/absent clients backpressure the tee
 
-        # Branch 3: Decode to raw frames for unix socket (MJPEG HTTP)
+        # Branch 3: Decode to raw BGR frames for MJPEG HTTP (via appsink)
         queue_decode = Gst.ElementFactory.make("queue", "queue_decode")
         avdec_h264 = Gst.ElementFactory.make("avdec_h264")
         if not avdec_h264:
@@ -336,16 +336,20 @@ class GstWebRTC:
                 "sudo apt install gstreamer1.0-libav"
             )
         videoconvert = Gst.ElementFactory.make("videoconvert")
-        unixfdsink = Gst.ElementFactory.make("unixfdsink")
-        if is_local_camera_available():
-            os.remove(CAMERA_SOCKET_PATH)
-        unixfdsink.set_property("socket-path", CAMERA_SOCKET_PATH)
+        appsink = Gst.ElementFactory.make("appsink", "frame_appsink")
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 1)
+        caps_bgr = Gst.Caps.from_string(
+            f"video/x-raw,format=BGR,width={width},height={height}"
+        )
+        appsink.set_property("caps", caps_bgr)
+        self._appsink = appsink
 
         elements = [
             fdsrc, h264parse, capsfilter_h264, h264_tee,
             queue_webrtc,
             queue_tcp, h264parse_tcp, mpegtsmux, tcpserversink,
-            queue_decode, avdec_h264, videoconvert, unixfdsink,
+            queue_decode, avdec_h264, videoconvert, appsink,
         ]
         if not all(elements):
             self._cleanup_rpicam()
@@ -369,14 +373,14 @@ class GstWebRTC:
         h264parse_tcp.link(mpegtsmux)
         mpegtsmux.link(tcpserversink)
 
-        # Branch 3: Decode → raw frames → unix socket
+        # Branch 3: Decode → raw BGR frames → appsink
         h264_tee.link(queue_decode)
         queue_decode.link(avdec_h264)
         avdec_h264.link(videoconvert)
-        videoconvert.link(unixfdsink)
+        videoconvert.link(appsink)
 
         self._logger.info(
-            "rpicam-vid pipeline configured: WebRTC + TCP:9001 + unix socket"
+            "rpicam-vid pipeline configured: WebRTC + TCP:9001 + appsink"
         )
 
     def _configure_video_v4l2(
@@ -393,13 +397,17 @@ class GstWebRTC:
         capsfilter = Gst.ElementFactory.make("capsfilter")
         capsfilter.set_property("caps", caps)
         tee = Gst.ElementFactory.make("tee")
-        # make camera accessible to other applications via unixfdsrc/sink
-        unixfdsink = Gst.ElementFactory.make("unixfdsink")
-        if is_local_camera_available():
-            # prevent crash if socket already exists
-            os.remove(CAMERA_SOCKET_PATH)
-        unixfdsink.set_property("socket-path", CAMERA_SOCKET_PATH)
-        queue_unixfd = Gst.ElementFactory.make("queue", "queue_unixfd")
+        # Appsink branch: raw BGR frames for MJPEG HTTP
+        appsink = Gst.ElementFactory.make("appsink", "frame_appsink")
+        appsink.set_property("drop", True)
+        appsink.set_property("max-buffers", 1)
+        caps_bgr = Gst.Caps.from_string(
+            f"video/x-raw,format=BGR,width={self.resolution[0]},height={self.resolution[1]}"
+        )
+        appsink.set_property("caps", caps_bgr)
+        self._appsink = appsink
+        queue_appsink = Gst.ElementFactory.make("queue", "queue_appsink")
+        videoconvert_appsink = Gst.ElementFactory.make("videoconvert", "videoconvert_appsink")
         queue_encoder = Gst.ElementFactory.make("queue", "queue_encoder")
         v4l2h264enc = Gst.ElementFactory.make("v4l2h264enc")
         extra_controls_structure = Gst.Structure.new_empty("extra-controls")
@@ -439,8 +447,9 @@ class GstWebRTC:
                 camerasrc,
                 capsfilter,
                 tee,
-                queue_unixfd,
-                unixfdsink,
+                queue_appsink,
+                videoconvert_appsink,
+                appsink,
                 queue_encoder,
                 v4l2h264enc,
                 capsfilter_h264,
@@ -457,8 +466,9 @@ class GstWebRTC:
         pipeline.add(camerasrc)
         pipeline.add(capsfilter)
         pipeline.add(tee)
-        pipeline.add(queue_unixfd)
-        pipeline.add(unixfdsink)
+        pipeline.add(queue_appsink)
+        pipeline.add(videoconvert_appsink)
+        pipeline.add(appsink)
         pipeline.add(queue_encoder)
         pipeline.add(v4l2h264enc)
         pipeline.add(capsfilter_h264)
@@ -471,8 +481,9 @@ class GstWebRTC:
 
         camerasrc.link(capsfilter)
         capsfilter.link(tee)
-        tee.link(queue_unixfd)
-        queue_unixfd.link(unixfdsink)
+        tee.link(queue_appsink)
+        queue_appsink.link(videoconvert_appsink)
+        videoconvert_appsink.link(appsink)
         tee.link(queue_encoder)
         queue_encoder.link(v4l2h264enc)
         v4l2h264enc.link(capsfilter_h264)
@@ -602,6 +613,34 @@ class GstWebRTC:
         self._pipeline_sender.set_state(Gst.State.NULL)
         self._pipeline_receiver.set_state(Gst.State.NULL)
         self._cleanup_rpicam()
+
+    @property
+    def is_running(self) -> bool:
+        """Check if the sender pipeline is in PLAYING state."""
+        _, state, _ = self._pipeline_sender.get_state(0)
+        return state == Gst.State.PLAYING
+
+    def read_frame(self) -> Optional[npt.NDArray[np.uint8]]:
+        """Pull the latest video frame from the pipeline's appsink.
+
+        Returns the frame as a BGR numpy array, or None if unavailable.
+        Thread-safe: can be called from any thread while GLib MainLoop
+        runs on another.
+        """
+        if self._appsink is None:
+            return None
+
+        sample = self._appsink.try_pull_sample(Gst.SECOND)  # 1s timeout
+        if sample is None:
+            return None
+
+        buf = sample.get_buffer()
+        if buf is None:
+            return None
+
+        data = buf.extract_dup(0, buf.get_size())
+        width, height = self.resolution
+        return np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
 
 
 if __name__ == "__main__":

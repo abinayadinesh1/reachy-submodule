@@ -1,51 +1,73 @@
-# Reachy Mini 🤖
+## Deploying & Testing New Code
 
-[![Ask on HuggingChat](https://img.shields.io/badge/Read_the-Documentation-yellow?logo=huggingface&logoColor=yellow)](https://huggingface.co/docs/reachy_mini/)
-[![Discord](https://img.shields.io/badge/Discord-Join_the_Community-7289DA?logo=discord&logoColor=white)](https://discord.gg/Y7FgMqHsub)
+### One-time setup (editable install)
+Do this once after cloning. It makes git pull immediately effective without reinstalling.
+```bash
+source /venvs/mini_daemon/bin/activate
+sudo /venvs/mini_daemon/bin/pip install -e /home/pollen/reachy-submodule
+```
 
-**Reachy Mini is an open-source, expressive robot made for hackers and AI builders.**
+### Normal deploy cycle
+```bash
+# on the robot:
+git pull
+sudo systemctl restart reachy-mini-daemon
+# wait ~10s for the daemon to initialize, then wake it up:
+curl -X POST 'http://localhost:8000/api/daemon/start?wake_up=true'
+```
 
-🛒 [**Buy Reachy Mini**](https://www.hf.co/reachy-mini/)
+### Verify WebRTC is running
+```bash
+ss -tlnp | grep 8443        # should show 0.0.0.0:8443
+ps aux | grep webrtc        # should show a python process
+```
 
-[![Reachy Mini Hello](/docs/assets/reachy_mini_hello.gif)](https://www.pollen-robotics.com/reachy-mini/)
+### When things go wrong
 
-## ⚡️ Build and start your own robot
+#### Check journal logs to find errors with the reachy-mini-daemon
+```sudo journalctl -u reachy-mini-daemon -f```
 
-**Choose your platform to access the specific guide:**
+**Service fails to start (status=203/EXEC)**
+The service file has a hardcoded path that goes stale. Fix it permanently:
+```bash
+# The source service file is the one that gets deployed on every start.
+# Edit it directly — don't edit /etc/systemd/system/ (launcher.sh overwrites it):
+nano /home/pollen/reachy-submodule/src/reachy_mini/daemon/app/services/wireless/reachy-mini-daemon.service
+# Set ExecStart and WorkingDirectory to the /home/pollen/reachy-submodule/src/... path
+sudo systemctl daemon-reload
+sudo systemctl start reachy-mini-daemon
+```
 
-| **🤖 Reachy Mini (Wireless)** | **🔌 Reachy Mini Lite** | **💻 Simulation** |
-| :---: | :---: | :---: |
-| The full autonomous experience.<br>Raspberry Pi 4 + Battery + WiFi. | The developer version.<br>USB connection to your computer. | No hardware required.<br>Prototype in MuJoCo. |
-| 👉 [**Go to Wireless Guide**](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini/get_started) | 👉 [**Go to Lite Guide**](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini_lite/get_started) | 👉 [**Go to Simulation**](https://huggingface.co/docs/reachy_mini/platforms/simulation/get_started) |
+**Service hangs on stop (takes 90s)**
+GStreamer webrtcsink blocks during teardown. Force it faster:
+```bash
+sudo systemctl kill reachy-mini-daemon   # immediate, skips teardown
+sudo systemctl start reachy-mini-daemon
+```
+To make it stop quickly by default, add `TimeoutStopSec=10` to the service file.
+
+**Port 8000 not up after start**
+The daemon does a pip reinstall on first run after certain changes — takes ~30s.
+Wait and retry:
+```bash
+watch -n2 'curl -s http://localhost:8000/api/daemon/status'
+```
+
+**Port 8443 (WebRTC) not up after wake**
+Wake_up hasn't started the GStreamer pipeline yet, or it crashed. Check:
+```bash
+sudo journalctl -u reachy-mini-daemon -n 80 --no-pager
+```
+
+**Corrupted pip packages (warnings about ~eachy-mini, ~yee, etc.)**
+Previous pip installs were interrupted. Clean up:
+```bash
+sudo rm -rf /venvs/mini_daemon/lib/python3.12/site-packages/\~*
+sudo /venvs/mini_daemon/bin/pip install -e /home/pollen/reachy-submodule
+```
 
 
 
-> ⚡ **Pro tip:** Install [uv](https://docs.astral.sh/uv/getting-started/installation/) for 10-100x faster app installations (auto-detected, falls back to `pip`).
-
-<br>
-
-## 📱 Apps & Ecosystem
-
-Reachy Mini comes with an app store powered by Hugging Face Spaces. You can install these apps directly from your robot's dashboard with one click!
-
-* **🗣️ [Conversation App](https://huggingface.co/spaces/pollen-robotics/reachy_mini_conversation_app):** Talk naturally with Reachy Mini (powered by LLMs).
-* **📻 [Radio](https://huggingface.co/spaces/pollen-robotics/reachy_mini_radio):** Listen to the radio with Reachy Mini!
-* **👋 [Hand Tracker](https://huggingface.co/spaces/pollen-robotics/hand_tracker_v2):** The robot follows your hand movements in real-time.
-
-👉 [**Browse all apps on Hugging Face**](https://hf.co/reachy-mini/#/apps)
-
-<br>
-
-## 🚀 Getting Started with Reachy Mini SDK
-
-### User guides
-* **[Installation](https://huggingface.co/docs/reachy_mini/SDK/installation)**: 5 minutes to set up your computer
-* **[Quickstart Guide](https://huggingface.co/docs/reachy_mini/SDK/quickstart)**: Run your first behavior on Reachy Mini
-* **[Python SDK](https://huggingface.co/docs/reachy_mini/SDK/python-sdk)**: Learn to move, see, speak, and hear.
-* **[AI Integrations](https://huggingface.co/docs/reachy_mini/SDK/integration)**: Connect LLMs, build Apps, and publish to Hugging Face.
-* **[Core Concepts](https://huggingface.co/docs/reachy_mini/SDK/core-concept)**: Architecture, coordinate systems, and safety limits.
-* 🤗[**Share your app with the community**](https://huggingface.co/blog/pollen-robotics/make-and-publish-your-reachy-mini-apps)
-* 📂 [**Browse the Examples Folder**](examples)
 
 ### Quick Look
 After [installing the SDK](https://huggingface.co/docs/reachy_mini/SDK/installation), once your robot is awake, you can control it in just **a few lines of code**:
@@ -72,20 +94,3 @@ Reachy Mini robots are sold as kits and generally take **2 to 3 hours** to assem
 * **Reachy Mini Lite:** Runs on your PC, powered via wall outlet. [See specs](https://huggingface.co/docs/reachy_mini/platforms/reachy_mini_lite/hardware).
 
 <br>
-
-## ❓ Troubleshooting
-
-Encountering an issue? 👉 **[Check the Troubleshooting & FAQ Guide](https://huggingface.co/docs/reachy_mini/troubleshooting)**
-
-<br>
-
-## 🤝 Community & Contributing
-
-* **Join the Community:** Join [Discord](https://discord.gg/2bAhWfXme9) to share your moments with Reachy, build apps together, and get help.
-* **Found a bug?** Open an issue on this repository.
-
-
-## License
-
-This project is licensed under the Apache 2.0 License. See the [LICENSE](LICENSE) file for details.
-Hardware design files are licensed under Creative Commons BY-SA-NC.

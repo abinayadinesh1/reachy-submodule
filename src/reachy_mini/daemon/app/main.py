@@ -167,15 +167,6 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                     pass
 
             # Ensure cleanup happens even if there's an exception
-            # Clean up camera reader if initialized
-            try:
-                if hasattr(app.state, "_camera_reader") and app.state._camera_reader is not None:
-                    logging.info("Closing camera reader...")
-                    app.state._camera_reader.close()
-                    app.state._camera_reader = None
-            except Exception as e:
-                logging.exception(f"Error closing camera reader: {e}")
-
             try:
                 logging.info("Shutting down app manager...")
                 await app.state.app_manager.close()

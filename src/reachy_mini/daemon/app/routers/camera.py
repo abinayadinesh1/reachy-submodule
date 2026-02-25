@@ -1,64 +1,43 @@
 """Camera-related API routes.
 
 Provides HTTP endpoints for grabbing camera frames and streaming
-MJPEG video from the Reachy Mini's camera. Works by reading from
-the unix socket that the WebRTC daemon creates at /tmp/reachymini_camera_socket.
+MJPEG video from the Reachy Mini's camera. Reads directly from
+the appsink in the WebRTC daemon's GStreamer pipeline.
 """
 
 import asyncio
 import logging
-import os
-import threading
-import time
-from typing import AsyncGenerator
+from typing import AsyncGenerator, Optional
 
 import cv2
 import numpy as np
+import numpy.typing as npt
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response, StreamingResponse
-
-from reachy_mini.daemon.utils import CAMERA_SOCKET_PATH
 
 router = APIRouter(prefix="/camera")
 
 logger = logging.getLogger(__name__)
-_camera_lock = threading.Lock()
 
 
-def _get_camera(request: Request):
-    """Get or lazily create the GStreamerCamera singleton."""
-    if not hasattr(request.app.state, "_camera_reader") or request.app.state._camera_reader is None:
-        with _camera_lock:
-            if not hasattr(request.app.state, "_camera_reader") or request.app.state._camera_reader is None:
-                if not os.path.exists(CAMERA_SOCKET_PATH):
-                    raise HTTPException(
-                        status_code=503,
-                        detail=f"Camera socket not found at {CAMERA_SOCKET_PATH}. "
-                        "Is the daemon running with --wireless-version and has WebRTC started?",
-                    )
-                from reachy_mini.media.camera_gstreamer import GStreamerCamera
-
-                cam = GStreamerCamera()
-                cam.open()
-                # Warmup: give pipeline time to produce first frame
-                for i in range(10):
-                    if cam.read() is not None:
-                        logger.info("Camera warmed up after %d reads", i + 1)
-                        break
-                    time.sleep(0.1)
-                request.app.state._camera_reader = cam
-                logger.info("Camera reader initialized from unix socket")
-    return request.app.state._camera_reader
+def _read_frame(request: Request) -> Optional[npt.NDArray[np.uint8]]:
+    """Read a single BGR frame from the WebRTC daemon's appsink."""
+    daemon = request.app.state.daemon
+    if daemon._webrtc is None:
+        return None
+    return daemon._webrtc.read_frame()
 
 
 @router.get("/status")
-async def get_camera_status() -> dict:
-    """Check camera availability and configuration."""
-    socket_exists = os.path.exists(CAMERA_SOCKET_PATH)
+async def get_camera_status(request: Request) -> dict:
+    """Check camera availability."""
+    daemon = request.app.state.daemon
+    webrtc = daemon._webrtc
+    webrtc_running = webrtc is not None and webrtc.is_running
+    mjpeg_available = webrtc is not None and webrtc._appsink is not None
     return {
-        "available": socket_exists,
-        "socket_path": CAMERA_SOCKET_PATH,
-        "socket_exists": socket_exists,
+        "webrtc_available": webrtc_running,
+        "mjpeg_available": mjpeg_available and webrtc_running,
     }
 
 
@@ -69,10 +48,12 @@ async def get_camera_frame(request: Request, quality: int = 80) -> Response:
     Args:
         quality: JPEG compression quality (1-100). Default: 80.
     """
-    camera = _get_camera(request)
-    frame = camera.read()
+    frame = _read_frame(request)
     if frame is None:
-        raise HTTPException(status_code=503, detail="No frame available from camera")
+        raise HTTPException(
+            status_code=503,
+            detail="No frame available. Is the daemon running with --wireless-version?",
+        )
 
     quality = max(1, min(100, quality))
     ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
@@ -86,10 +67,9 @@ async def _mjpeg_generator(
     request: Request, quality: int, fps: float
 ) -> AsyncGenerator[bytes, None]:
     """Generate MJPEG frames for streaming."""
-    camera = _get_camera(request)
     period = 1.0 / fps
     while True:
-        frame = camera.read()
+        frame = _read_frame(request)
         if frame is not None:
             ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
             if ret:
@@ -117,4 +97,8 @@ async def get_camera_stream(
     return StreamingResponse(
         _mjpeg_generator(request, quality, fps),
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "X-Accel-Buffering": "no",
+        },
     )
