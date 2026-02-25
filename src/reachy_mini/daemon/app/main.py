@@ -167,6 +167,15 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
                     pass
 
             # Ensure cleanup happens even if there's an exception
+            # Close aiortc peer connections if any
+            if args.wireless_version:
+                try:
+                    from .routers.webrtc_simple import cleanup_peer_connections
+
+                    await cleanup_peer_connections()
+                except Exception as e:
+                    logging.exception(f"Error closing WebRTC connections: {e}")
+
             try:
                 logging.info("Shutting down app manager...")
                 await app.state.app_manager.close()
@@ -208,9 +217,10 @@ def create_app(args: Args, health_check_event: asyncio.Event | None = None) -> F
     router.include_router(volume.router)
 
     if args.wireless_version:
-        from .routers import cache, camera, update, wifi_config
+        from .routers import cache, camera, update, webrtc_simple, wifi_config
 
         router.include_router(camera.router)
+        router.include_router(webrtc_simple.router)
         app.include_router(cache.router)
         app.include_router(logs.router)
         app.include_router(update.router)
