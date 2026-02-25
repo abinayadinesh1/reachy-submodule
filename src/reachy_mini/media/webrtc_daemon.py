@@ -176,6 +176,9 @@ class GstWebRTC:
         # the latency cost outweighs the reliability gain.
         webrtcsink.set_property("do-fec", False)
         webrtcsink.set_property("do-retransmission", False)
+        # Disable GCC congestion control — it paces/holds packets to probe bandwidth,
+        # adding 50–150ms on a predictable LAN/Tailscale link where bandwidth is not constrained.
+        webrtcsink.set_property("congestion-control", 0)  # 0 = disabled
 
         webrtcsink.connect("consumer-added", self._consumer_added)
 
@@ -281,6 +284,7 @@ class GstWebRTC:
             "--codec", "h264",
             "--profile", "baseline",       # constrained baseline for Safari/WebKit
             "--inline",                    # repeat SPS/PPS (matches repeat_sequence_header=1)
+            "--low-latency",               # reduces encoder delay from ~8 frames to ~1 frame (~230ms win)
             "--bitrate", "5000000",        # 5 Mbps (matches v4l2h264enc video_bitrate)
             "--intra", "15",               # IDR every 15 frames (0.5s at 30fps) — faster connect/recovery
             "-o", "-",                     # output to stdout
@@ -295,6 +299,7 @@ class GstWebRTC:
         fdsrc.set_property("fd", self._rpicam_proc.stdout.fileno())
 
         h264parse = Gst.ElementFactory.make("h264parse")
+        h264parse.set_property("config-interval", -1)  # send SPS/PPS with every IDR — faster browser decode start
 
         # Caps filter so webrtcsink knows it's receiving pre-encoded H.264
         caps_h264 = Gst.Caps.from_string(
