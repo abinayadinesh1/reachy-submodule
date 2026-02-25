@@ -16,6 +16,11 @@ sudo systemctl restart reachy-mini-daemon
 curl -X POST 'http://localhost:8000/api/daemon/start?wake_up=true'
 ```
 
+### how to activate the venv or install something
+source /venvs/mini_daemon/bin/activate
+sudo /venvs/mini_daemon/bin/pip install aiortc
+
+
 ### Verify WebRTC is running
 ```bash
 ss -tlnp | grep 8443        # should show 0.0.0.0:8443
