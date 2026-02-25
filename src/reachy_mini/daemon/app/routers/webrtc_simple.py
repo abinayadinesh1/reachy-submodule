@@ -147,10 +147,19 @@ async def webrtc_test_page() -> HTMLResponse:
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
 
+        // Wait for ICE gathering to complete (no trickle ICE with HTTP POST)
+        if (pc.iceGatheringState !== 'complete') {
+          await new Promise(r => {
+            pc.addEventListener('icegatheringstatechange', () => {
+              if (pc.iceGatheringState === 'complete') r();
+            });
+          });
+        }
+
         const resp = await fetch('/api/webrtc/offer', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+          body: JSON.stringify({ sdp: pc.localDescription.sdp, type: pc.localDescription.type }),
         });
         const answer = await resp.json();
         await pc.setRemoteDescription(answer);
