@@ -157,8 +157,7 @@ class GstWebRTC:
         if cam_path == "imx708":
             self._configure_video_rpicam(pipeline)
         else:
-            self._logger.debug(f"Not configuring video.")
-            # self._configure_video_v4l2(cam_path, pipeline)
+            self._configure_video_v4l2(cam_path, pipeline)
 
     def _configure_video_rpicam(self, pipeline: Gst.Pipeline) -> None:
         """Configure video using rpicam-vid subprocess for IMX708 camera.
