@@ -7,6 +7,8 @@ the appsink in the WebRTC daemon's GStreamer pipeline.
 
 import asyncio
 import logging
+import threading
+import time
 from typing import AsyncGenerator, Optional
 
 import cv2
@@ -19,6 +21,12 @@ router = APIRouter(prefix="/camera")
 
 logger = logging.getLogger(__name__)
 
+# Cache the most recent JPEG encode per quality level so multiple clients
+# viewing the same stream don't each trigger a redundant cv2.imencode call.
+_jpeg_cache_lock = threading.Lock()
+_jpeg_cache: dict[int, tuple[float, bytes]] = {}  # quality -> (timestamp, jpeg_bytes)
+_JPEG_CACHE_MAX_AGE = 0.030  # 30ms — serve cached frame if younger than this
+
 
 def _read_frame(request: Request) -> Optional[npt.NDArray[np.uint8]]:
     """Read a single BGR frame from the WebRTC daemon's appsink."""
@@ -26,6 +34,28 @@ def _read_frame(request: Request) -> Optional[npt.NDArray[np.uint8]]:
     if daemon._webrtc is None:
         return None
     return daemon._webrtc.read_frame()
+
+
+def _encode_frame(
+    frame: npt.NDArray[np.uint8], quality: int
+) -> Optional[bytes]:
+    """JPEG-encode a frame, returning cached bytes when possible."""
+    now = time.monotonic()
+
+    with _jpeg_cache_lock:
+        cached = _jpeg_cache.get(quality)
+        if cached is not None and (now - cached[0]) < _JPEG_CACHE_MAX_AGE:
+            return cached[1]
+
+    ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ret:
+        return None
+    jpeg_bytes = jpeg.tobytes()
+
+    with _jpeg_cache_lock:
+        _jpeg_cache[quality] = (now, jpeg_bytes)
+
+    return jpeg_bytes
 
 
 @router.get("/status")
@@ -48,7 +78,8 @@ async def get_camera_frame(request: Request, quality: int = 80) -> Response:
     Args:
         quality: JPEG compression quality (1-100). Default: 80.
     """
-    frame = _read_frame(request)
+    loop = asyncio.get_event_loop()
+    frame = await loop.run_in_executor(None, _read_frame, request)
     if frame is None:
         raise HTTPException(
             status_code=503,
@@ -56,26 +87,34 @@ async def get_camera_frame(request: Request, quality: int = 80) -> Response:
         )
 
     quality = max(1, min(100, quality))
-    ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not ret:
+    jpeg_bytes = await loop.run_in_executor(None, _encode_frame, frame, quality)
+    if jpeg_bytes is None:
         raise HTTPException(status_code=500, detail="Failed to encode frame as JPEG")
 
-    return Response(content=jpeg.tobytes(), media_type="image/jpeg")
+    return Response(content=jpeg_bytes, media_type="image/jpeg")
 
 
 async def _mjpeg_generator(
     request: Request, quality: int, fps: float
 ) -> AsyncGenerator[bytes, None]:
-    """Generate MJPEG frames for streaming."""
+    """Generate MJPEG frames for streaming.
+
+    Blocking calls (_read_frame, _encode_frame) are offloaded to the
+    default thread-pool executor so multiple generators can run
+    concurrently without serialising on the asyncio event loop.
+    """
     period = 1.0 / fps
+    loop = asyncio.get_event_loop()
     while True:
-        frame = _read_frame(request)
+        frame = await loop.run_in_executor(None, _read_frame, request)
         if frame is not None:
-            ret, jpeg = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
-            if ret:
+            jpeg_bytes = await loop.run_in_executor(
+                None, _encode_frame, frame, quality
+            )
+            if jpeg_bytes is not None:
                 yield (
                     b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg.tobytes() + b"\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + jpeg_bytes + b"\r\n"
                 )
         await asyncio.sleep(period)
 

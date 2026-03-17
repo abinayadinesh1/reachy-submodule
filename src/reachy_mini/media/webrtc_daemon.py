@@ -157,7 +157,8 @@ class GstWebRTC:
         if cam_path == "imx708":
             self._configure_video_rpicam(pipeline)
         else:
-            self._configure_video_v4l2(cam_path, pipeline)
+            self._logger.debug(f"Not configuring video.")
+            # self._configure_video_v4l2(cam_path, pipeline)
 
     def _configure_video_rpicam(self, pipeline: Gst.Pipeline) -> None:
         """Configure video using rpicam-vid subprocess for IMX708 camera.
@@ -184,7 +185,7 @@ class GstWebRTC:
             "--profile", "baseline",       # constrained baseline for Safari/WebKit
             "--inline",                    # repeat SPS/PPS (matches repeat_sequence_header=1)
             "--low-latency",               # reduces encoder delay from ~8 frames to ~1 frame (~230ms win)
-            "--bitrate", "5000000",        # 5 Mbps
+            "--bitrate", "1000000",        # 1 Mbps — lower headroom reduces CBR rate-control spikes in static scenes
             "--intra", "15",               # IDR every 15 frames (0.5s at 30fps) — faster connect/recovery
             "-o", "-",                     # output to stdout
         ]
@@ -259,7 +260,7 @@ class GstWebRTC:
         h264parse_tcp.link(mpegtsmux)
         mpegtsmux.link(tcpserversink)
 
-        # Branch 2: Decode → raw BGR frames → appsink
+        # Branch 2: Decode → raw BGR frames → appsink2
         h264_tee.link(queue_decode)
         queue_decode.link(avdec_h264)
         avdec_h264.link(videoconvert)

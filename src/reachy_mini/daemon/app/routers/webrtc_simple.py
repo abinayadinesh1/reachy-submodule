@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # Track active peer connections for cleanup
 peer_connections: Set[RTCPeerConnection] = set()
 
+# MediaRelay lets multiple peer connections share a single encoded stream
+# instead of each peer triggering an independent software video encode.
+relay = MediaRelay()
+_source_track: "CameraTrack | None" = None
+
 
 class CameraTrack(VideoStreamTrack):
     """VideoStreamTrack that reads frames from the GStreamer appsink."""
@@ -69,6 +74,8 @@ async def webrtc_offer(request: Request) -> JSONResponse:
     Browser sends: {"sdp": "...", "type": "offer"}
     Server returns: {"sdp": "...", "type": "answer"}
     """
+    global _source_track
+
     params = await request.json()
 
     pc = RTCPeerConnection()
@@ -81,8 +88,11 @@ async def webrtc_offer(request: Request) -> JSONResponse:
             await pc.close()
             peer_connections.discard(pc)
 
-    # Add video track
-    pc.addTrack(CameraTrack(request))
+    # Lazily create one shared source track; relay.subscribe() copies the
+    # encoded packets to each peer without re-encoding.
+    if _source_track is None:
+        _source_track = CameraTrack(request)
+    pc.addTrack(relay.subscribe(_source_track))
 
     # Set remote offer and create answer
     offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
